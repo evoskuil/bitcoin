@@ -436,54 +436,194 @@ bool CheckSequenceLocks(const CTransaction &tx, int flags, LockPoints* lp, bool 
     return EvaluateSequenceLocks(index, lockPair);
 }
 
+// Cloned from script.cpp...
 
-unsigned int GetLegacySigOpCount(const CTransaction& tx)
+size_t CScript::GetSigOpCount(bool embedded) const
 {
-    unsigned int nSigOps = 0;
+    size_t count = 0;
+	opcodetype opcode;
+    const_iterator pc = begin();
+    opcodetype previous = OP_INVALIDOPCODE;
+	
+    while (pc < end() && GetOp(pc, opcode))
+    {
+        if (opcode == OP_CHECKSIG || opcode == OP_CHECKSIGVERIFY)
+		{
+            count++;
+		}
+        else if (opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY)
+        {
+            if (embedded && previous >= OP_1 && previous <= OP_16)
+                count += DecodeOP_N(previous);
+            else
+                count += MAX_PUBKEYS_PER_MULTISIG;
+        }
+
+        previous = opcode;
+    }
+
+    return count;
+}
+
+size_t CScript::GetSigOpCount(const CScript& input_script) const
+{
+    if (prevout_script.IsPayToScriptHash() && input_script.IsPushOnly())
+	{
+		// MOCKUP: Convert the last token in the push-only stack.
+        const auto embedded_script = input_script.GetEmbeddedScript();
+		return embedded_script.GetSigOpCount(true);
+    }
+	
+	return 0;
+}
+
+// original...
+
+size_t GetLegacySigOpCount(const CTransaction& tx)
+{
+    auto nSigOps = 0;
+	
     for (const auto& txin : tx.vin)
     {
         nSigOps += txin.scriptSig.GetSigOpCount(false);
     }
+	
     for (const auto& txout : tx.vout)
     {
         nSigOps += txout.scriptPubKey.GetSigOpCount(false);
     }
+	
     return nSigOps;
 }
 
-unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& inputs)
+size_t GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& inputs)
 {
+	// Skipping coinbase here is a (redundant) optimization, not logically required.
+	// Coinbase cannot have a prevout, so no bip16 sigops.
     if (tx.IsCoinBase())
         return 0;
 
-    unsigned int nSigOps = 0;
-    for (unsigned int i = 0; i < tx.vin.size(); i++)
+    auto count = 0;
+    for (auto i = 0; i < tx.vin.size(); i++)
     {
-        const CTxOut &prevout = inputs.GetOutputFor(tx.vin[i]);
-        if (prevout.scriptPubKey.IsPayToScriptHash())
-            nSigOps += prevout.scriptPubKey.GetSigOpCount(tx.vin[i].scriptSig);
+        const auto& prevout = inputs.GetOutputFor(tx.vin[i]);
+        const auto& prevout_script = prevout.scriptPubKey;
+		const auto& input_script = tx.vin[i].scriptSig;
+		////const auto& witness = tx.vin[i].scriptWitness;
+		
+		// Segwit programs do not allow for signatures in the input_script, so this is harmless (but wasteful).
+		// If the prevout is p2sh pattern and input script is data, count input script embedded sigops.
+        if (prevout_script.IsPayToScriptHash())
+            count += prevout_script.GetSigOpCount(input_script);
     }
-    return nSigOps;
+
+    return count;
 }
 
-int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& inputs, int flags)
+size_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& inputs, uint32_t flags)
 {
-    int64_t nSigOps = GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR;
+	// Legacy input/output legacy sigops are counted (includes coinbase).
+    auto count = GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR;
 
-    if (tx.IsCoinBase())
-        return nSigOps;
+	// Skipping coinbase here is an optimization, not logically required.
+	// Coinbase input.witness cannot have sigops (1 reserved 32 byte data token).
+	// Coinbase input cannot have witness sigops since the witness is neither p2wsh nor p2wpkh.
+	// Coinbase outputs cannot have witness sigops, since outputs cannot have witness sigops.
+	// Coinbase cannot have a prevout, so no bip16 sigops.
+    ////if (tx.IsCoinBase())
+    ////    return count;
 
-    if (flags & SCRIPT_VERIFY_P2SH) {
-        nSigOps += GetP2SHSigOpCount(tx, inputs) * WITNESS_SCALE_FACTOR;
-    }
+	//// count += GetP2SHSigOpCount(tx, inputs) * WITNESS_SCALE_FACTOR;
+	/////////////////////////////////////////////////////////////////////////////////////////////////
+	// BIP16 sigops are counted for each input.
+    if (flags & SCRIPT_VERIFY_P2SH)
+	{
+		for (auto i = 0; i < tx.vin.size(); i++)
+		{
+			const auto& prevout = inputs.GetOutputFor(tx.vin[i]);
+			const auto& prevout_script = prevout.scriptPubKey;
+			const auto& input_script = tx.vin[i].scriptSig;
+			////const auto& witness = tx.vin[i].scriptWitness;
+			
+			// Segwit programs do not allow for signatures in the input_script, so this is harmless (but wasteful).
+			// If the prevout is p2sh pattern and input script is data, count input script embedded sigops.
+			count += prevout_script.GetSigOpCount(input_script);
+		}
+	}
+	/////////////////////////////////////////////////////////////////////////////////////////////////
 
-    for (unsigned int i = 0; i < tx.vin.size(); i++)
-    {
-        const CTxOut &prevout = inputs.GetOutputFor(tx.vin[i]);
-        nSigOps += CountWitnessSigOps(tx.vin[i].scriptSig, prevout.scriptPubKey, &tx.vin[i].scriptWitness, flags);
-    }
-    return nSigOps;
+	// THIS SHOULD PREDEED P2SH AND PREVENT A WITNESS RESULT FROM PROCESSING HERE FOR A P2SH RESULT.
+	// BIP141 sigops are counted for each input.
+	if (flags & SCRIPT_VERIFY_WITNESS)
+	{
+		for (auto i = 0; i < tx.vin.size(); i++)
+		{
+			const auto& prevout = inputs.GetOutputFor(tx.vin[i]);
+			const auto& prevout_script = prevout.scriptPubKey;
+			const auto& input_script = tx.vin[i].scriptSig;
+			const auto& witness = tx.vin[i].scriptWitness;
+			
+			// This is the only call to count witness sigops.
+			count += CountWitnessSigOps(input_script, prevout_script, witness);
+		}
+	}
+
+    return count;
 }
+
+// Cloned from interpreter.cpp...
+
+size_t static WitnessSigOps(uint8_t witness_version, const std::vector<unsigned char>& witness_program, const CScriptWitness& witness)
+{
+    if (witness_version == 0)
+	{
+		// P2WPK has one sigop (can just return the witness script).
+        if (witness_program.size() == 20)
+		{
+            ////return 1;
+			
+			// MOCKUP: The witness script must be an unversioned script (with 2 tokens and 1 sigop).
+            return witness.GetSigOpCount(true);			
+		}
+
+		// Count the sigops in the embedded witness script.
+        if (witness_program.size() == 32 && witness.stack.size() > 0)
+		{
+			// The last stack element of the witness script is an embedded (v0) script.
+			const auto& embedded = witness.stack.back();
+            CScript embedded_script(embedded.begin(), embedded.end());
+            return embedded_script.GetSigOpCount(true);
+        }
+    }
+
+    // Future flags may be implemented here.
+    return 0;
+}
+
+size_t CountWitnessSigOps(const CScript& input_script, const CScript& prevout_script, const CScriptWitness& witness)
+{
+	// BIP141 has an implicit dependency on BIP16??
+    ////assert(flags & SCRIPT_VERIFY_P2SH);
+    uint8_t witness_version;
+    std::vector<uint8_t> witness_program;
+
+    if (prevout_script.IsWitnessProgram(witness_version, witness_program))
+        return WitnessSigOps(witness_version, witness_program, witness);
+
+	// Case of traditional P2SH (relaxed push).
+    if (prevout_script.IsPayToScriptHash() && input_script.IsPushOnly())
+	{
+		// MOCKUP: Convert the last token in the push-only stack.
+        const auto embedded_script = input_script.GetEmbeddedScript();
+
+        if (embedded_script.IsWitnessProgram(witness_version, witness_program))
+            return WitnessSigOps(witness_version, witness_program, witness);
+    }
+
+    return 0;
+}
+
+// original...
 
 
 

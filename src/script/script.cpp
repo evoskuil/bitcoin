@@ -153,89 +153,119 @@ const char* GetOpName(opcodetype opcode)
     }
 }
 
-unsigned int CScript::GetSigOpCount(bool fAccurate) const
+size_t CScript::GetSigOpCount(bool embedded) const
 {
-    unsigned int n = 0;
+    size_t count = 0;
+	opcodetype opcode;
     const_iterator pc = begin();
-    opcodetype lastOpcode = OP_INVALIDOPCODE;
-    while (pc < end())
+    opcodetype previous = OP_INVALIDOPCODE;
+	
+    while (pc < end() && GetOp(pc, opcode))
     {
-        opcodetype opcode;
-        if (!GetOp(pc, opcode))
-            break;
         if (opcode == OP_CHECKSIG || opcode == OP_CHECKSIGVERIFY)
-            n++;
+		{
+            count++;
+		}
         else if (opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY)
         {
-            if (fAccurate && lastOpcode >= OP_1 && lastOpcode <= OP_16)
-                n += DecodeOP_N(lastOpcode);
+            if (embedded && previous >= OP_1 && previous <= OP_16)
+                count += DecodeOP_N(previous);
             else
-                n += MAX_PUBKEYS_PER_MULTISIG;
+                count += MAX_PUBKEYS_PER_MULTISIG;
         }
-        lastOpcode = opcode;
+
+        previous = opcode;
     }
-    return n;
+
+    return count;
 }
 
-unsigned int CScript::GetSigOpCount(const CScript& scriptSig) const
+size_t CScript::GetSigOpCount(const CScript& input_script) const
 {
+	// If the output script is not p2sh pattern, then nothing to do.
     if (!IsPayToScriptHash())
         return GetSigOpCount(true);
 
     // This is a pay-to-script-hash scriptPubKey;
-    // get the last item that the scriptSig
-    // pushes onto the stack:
-    const_iterator pc = scriptSig.begin();
-    vector<unsigned char> data;
-    while (pc < scriptSig.end())
+    // get the last item that the scriptSig pushes onto the stack:
+    auto pc = input_script.begin();
+    vector<unsigned char> embedded;
+	
+	// Ensure the full stack is relaxed push.
+    while (pc < input_script.end())
     {
         opcodetype opcode;
-        if (!scriptSig.GetOp(pc, opcode, data))
+		
+		// This deferred validation is different than libbitcoin.
+		// We parse the stack and return a failed element at the end.
+		// This will produce a valid sigop count up to the point of
+		// the failed parse (vs. zero). The satoshi way of returning
+		// the failure results in a lower sigop count than libbitcoin.
+		// However both methods will fail in validation, which cannot
+		// be shortcircuited. This can result in disagreement on the
+		// reason for the failure (sigops vs. script invalid) but not
+		// a consensus difference. This additional test would reduce
+		// our performance as it is in the loop, so we don't do it.
+        if (!input_script.GetOp(pc, opcode, embedded))
             return 0;
+		
+		// This is the is_relaxed_push() test.
         if (opcode > OP_16)
             return 0;
     }
 
-    /// ... and return its opcount:
-    CScript subscript(data.begin(), data.end());
-    return subscript.GetSigOpCount(true);
+    // Return embedded scripts bip16 sigops.
+    CScript embedded_script(embedded.begin(), embedded.end());
+    return embedded_script.GetSigOpCount(true);
 }
 
+// Extra-fast test for pay-to-script-hash CScripts:
 bool CScript::IsPayToScriptHash() const
 {
-    // Extra-fast test for pay-to-script-hash CScripts:
-    return (this->size() == 23 &&
-            (*this)[0] == OP_HASH160 &&
-            (*this)[1] == 0x14 &&
-            (*this)[22] == OP_EQUAL);
+	const auto& self = *this;
+	
+    return (size() == 23 &&
+            self[0] == OP_HASH160 &&
+            self[1] == 0x14 &&
+            self[22] == OP_EQUAL);
 }
 
+// Extra-fast test for pay-to-witness-script-hash CScripts:
 bool CScript::IsPayToWitnessScriptHash() const
 {
-    // Extra-fast test for pay-to-witness-script-hash CScripts:
-    return (this->size() == 34 &&
-            (*this)[0] == OP_0 &&
-            (*this)[1] == 0x20);
+	const auto& self = *this;
+
+    return (size() == 34 &&
+            self[0] == OP_0 &&
+            self[1] == 0x20);
 }
 
-// A witness program is any valid CScript that consists of a 1-byte push opcode
-// followed by a data push between 2 and 40 bytes.
-bool CScript::IsWitnessProgram(int& version, std::vector<unsigned char>& program) const
+// A witness program is any valid CScript that consists of a 1-byte
+// push opcode followed by a data push between 2 and 40 bytes.
+bool CScript::IsWitnessProgram(uint8_t& out_version, std::vector<uint8_t>& out_program) const
 {
-    if (this->size() < 4 || this->size() > 42) {
+	const auto& self = *this;
+	
+	// If not exactly two opcodes, it is not a witness.
+    if (size() < 4 || size() > 42)
         return false;
-    }
-    if ((*this)[0] != OP_0 && ((*this)[0] < OP_1 || (*this)[0] > OP_16)) {
+
+	// If leading opcode is not nonnegative (is_version), it is not a witness.
+    if ((self[0] != OP_0) && (self[0] < OP_1 || self[0] > OP_16))
         return false;
-    }
-    if ((size_t)((*this)[1] + 2) == this->size()) {
-        version = DecodeOP_N((opcodetype)(*this)[0]);
-        program = std::vector<unsigned char>(this->begin() + 2, this->end());
+	
+	// The size prefix is varint but single byte; plus self and version.
+    if (self[1] + 2u == size())
+	{
+        out_version = DecodeOP_N(static_cast<opcodetype>(self[0]));
+        out_program = std::vector<uint8_t>(begin() + 2, end());
         return true;
     }
+	
     return false;
 }
 
+// RELAXED PUSH
 bool CScript::IsPushOnly(const_iterator pc) const
 {
     while (pc < end())
@@ -243,6 +273,7 @@ bool CScript::IsPushOnly(const_iterator pc) const
         opcodetype opcode;
         if (!GetOp(pc, opcode))
             return false;
+
         // Note that IsPushOnly() *does* consider OP_RESERVED to be a
         // push-type opcode, however execution of OP_RESERVED fails, so
         // it's not relevant to P2SH/BIP62 as the scriptSig would fail prior to
@@ -250,12 +281,13 @@ bool CScript::IsPushOnly(const_iterator pc) const
         if (opcode > OP_16)
             return false;
     }
+
     return true;
 }
 
 bool CScript::IsPushOnly() const
 {
-    return this->IsPushOnly(begin());
+    return IsPushOnly(begin());
 }
 
 std::string CScriptWitness::ToString() const
